@@ -1,0 +1,139 @@
+import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torchvision import models, transforms
+import numpy as np
+import cv2
+import os
+
+# ----------------- Grad-CAM Class -----------------
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.features = []
+        self.gradients = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.features.append(output)
+
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients.append(grad_out[0])
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+
+    def __call__(self, input_image, target_class):
+        self.model.eval()
+        self.features = []
+        self.gradients = []
+
+        output = self.model(input_image)
+        self.model.zero_grad()
+        class_loss = F.cross_entropy(output, torch.tensor([target_class]))
+        class_loss.backward()
+
+        feature_maps = self.features[0].squeeze()
+        gradient = self.gradients[0].squeeze()
+
+        weights = gradient.mean(dim=(1, 2), keepdim=True)
+        cam = (weights * feature_maps).sum(dim=0)
+        cam = F.relu(cam)
+        cam = cam - cam.min()
+        cam = cam / cam.max()
+
+        return cam.detach().cpu().numpy()
+
+# ----------------- Preprocessing -----------------
+def preprocess_image(image, size=(224, 224)):
+    transform = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    image = transform(image).unsqueeze(0)
+    return image
+
+def overlay_cam_on_image(full_img, cam, intensity=0.5):
+    cam_resized = cv2.resize(cam, (full_img.shape[1], full_img.shape[0]))
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255
+    overlay = intensity * heatmap + (1 - intensity) * full_img
+    overlay = overlay / np.max(overlay)
+    return np.uint8(overlay*255)
+
+# ----------------- Load Models -----------------
+# YOLO for detection
+yolo_model = YOLO(r"D:\Projects\ML mini project\runs\detect\brain_tumor_detect2\weights\best.pt")
+
+# CNN classifier for Grad-CAM
+cnn_model = models.resnet50(pretrained=True)  # replace with your trained tumor classifier
+target_layer = cnn_model.layer4[1].conv2
+grad_cam = GradCAM(cnn_model, target_layer)
+
+# ----------------- Streamlit App -----------------
+st.set_page_config(page_title="Brain Tumor Detection + Grad-CAM", layout="centered")
+st.title("🧠 Brain Tumor Detection + Grad-CAM Visualization")
+
+uploaded_file = st.file_uploader("Upload a brain MRI image", type=["jpg", "jpeg", "png"])
+
+pixel_spacing_x = 0.5
+pixel_spacing_y = 0.5
+
+def tumor_level(area_mm2):
+    if area_mm2 < 500:
+        return "Safe ✅"
+    elif 500 <= area_mm2 < 1500:
+        return "Caution ⚠️"
+    else:
+        return "Danger ❌"
+
+if uploaded_file:
+    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+    img_path = "temp.jpg"
+    with open(img_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    if st.button("🔍 Detect Tumor & Show Grad-CAM"):
+        results = yolo_model.predict(source=img_path, conf=0.25, save=False)
+        res = results[0]
+
+        img_pil = Image.open(img_path).convert('RGB')
+        img_np = np.array(img_pil)/255
+
+        if len(res.boxes) > 0:
+            st.success(f"🟢 Tumor(s) Found: {len(res.boxes)}")
+
+            # Generate Grad-CAM on the full image
+            input_tensor = preprocess_image(img_pil)
+            cam_full = grad_cam(input_tensor, target_class=1)
+            cam_overlay_full = overlay_cam_on_image(img_np, cam_full, intensity=0.5)
+            st.image(cam_overlay_full, caption="Grad-CAM Overlay on Full Brain", use_column_width=True)
+
+            for i, box in enumerate(res.boxes):
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                width = x2 - x1
+                height = y2 - y1
+                area_pixels = width * height
+                area_mm2 = area_pixels * pixel_spacing_x * pixel_spacing_y
+                conf = float(box.conf[0]) * 100
+                level = tumor_level(area_mm2)
+
+                st.write(f"**Tumor {i+1}:**")
+                st.write(f"- Confidence: {conf:.2f}%")
+                st.write(f"- Width: {width} px")
+                st.write(f"- Height: {height} px")
+                st.write(f"- Area: {area_pixels:.2f} px² ({area_mm2:.2f} mm²)")
+                st.write(f"- Tumor Level: {level}")
+
+            # Show bounding boxes on original image
+            result_img = res.plot()
+            st.image(result_img, caption="Detection Result with Bounding Boxes", use_column_width=True)
+
+        else:
+            st.error("🔴 No Tumor Found in the MRI scan.")
