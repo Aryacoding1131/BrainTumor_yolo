@@ -1,0 +1,5 @@
+train: /path/to/brain_tumor_dataset/images/train
+val: /path/to/brain_tumor_dataset/images/val
+
+nc: 1  # number of classes
+names: ['tumor']
